@@ -170,3 +170,4 @@ test_medusa*
 # test
 notebooks/test*.ipynb
 notebooks/*.pdf
+austin_medusa

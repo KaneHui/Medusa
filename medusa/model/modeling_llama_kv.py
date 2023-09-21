@@ -1002,6 +1002,10 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds,
             past_key_values_length,
         )
+        self.attention_mask = attention_mask
+        self.position_ids = position_ids
+        # print("attention_mask", attention_mask.size())
+        # print("position_ids", position_ids.size())
 
         hidden_states = inputs_embeds
 

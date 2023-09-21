@@ -181,15 +181,17 @@ class MedusaModel(nn.Module):
             base_model,
             medusa_config.medusa_num_heads,
             medusa_config.medusa_num_layers,
+            medusa_config.medusa_num_decoder_layers,
             medusa_config.base_model_name_or_path,
         )
-        medusa_head_path = os.path.join(medusa_head_name_or_path, "medusa_lm_head.pt")
+        medusa_head_path = os.path.join(medusa_head_name_or_path, "decoder_lm_head.pt")
         if os.path.exists(medusa_head_path):
             filename = medusa_head_path
         else:
-            filename = hf_hub_download(medusa_head_name_or_path, "medusa_lm_head.pt")
-        medusa_head_state_dict = torch.load(filename, map_location=base_model.device)
-        model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
+            filename = hf_hub_download(medusa_head_name_or_path, "decoder_lm_head.pt")
+        medusa_decoder_head_state_dict = torch.load(filename, map_location=base_model.device)
+        model.medusa_head.load_state_dict(medusa_decoder_head_state_dict, strict=False)
+        model.medusa_decoder_layers.load_state_dict(medusa_decoder_head_state_dict, strict=False)
 
         return model
 
@@ -306,26 +308,31 @@ class MedusaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states = output_hidden_states,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
-
+        # print(type(outputs.hidden_states))
         # ===
         # [MEDUSA-COPY]
         # Clone the output hidden states before Medusa decoder fork
         hidden_states = (outputs.hidden_states)[-1 * (self.medusa_num_decoder_layers + 1)].clone()
 
-        attention_mask, position_ids = self._prepare_decoder_inputs(
-            hidden_states, past_key_values, input_ids, position_ids, attention_mask
-        )
-
+        # attention_mask, position_ids = self._prepare_decoder_inputs(
+        #     hidden_states, past_key_values, input_ids, position_ids, attention_mask
+        # )
+        attention_mask = self.base_model.model.attention_mask
+        position_ids = self.base_model.model.position_ids
+        # print(attention_mask.shape, position_ids.shape)
         # Pass hidden states through medusa decoder layers
-        for decoder_layer in self.medusa_decoder_layers:
-          layer_outputs = decoder_layer(
+        if past_key_values is not None:
+            medusa_past_key_values = past_key_values[-self.medusa_num_decoder_layers:]
+        for i in range(self.medusa_num_decoder_layers):
+          layer_outputs = self.medusa_decoder_layers[i](
               hidden_states,
               attention_mask=attention_mask,
               position_ids=position_ids,
-              past_key_value=None,
+              past_key_value=medusa_past_key_values[i],
               output_attentions=False,
               use_cache=False,
           )
