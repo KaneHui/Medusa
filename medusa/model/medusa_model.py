@@ -190,8 +190,21 @@ class MedusaModel(nn.Module):
         else:
             filename = hf_hub_download(medusa_head_name_or_path, "decoder_lm_head.pt")
         medusa_decoder_head_state_dict = torch.load(filename, map_location=base_model.device)
-        model.medusa_head.load_state_dict(medusa_decoder_head_state_dict, strict=False)
-        model.medusa_decoder_layers.load_state_dict(medusa_decoder_head_state_dict, strict=False)
+        model_keys = set(model.medusa_decoder_layers.state_dict().keys())
+        loaded_keys = set(medusa_decoder_head_state_dict['medusa_decoder_layers'].keys())
+
+        missing_keys = model_keys - loaded_keys
+        extra_keys = loaded_keys - model_keys
+
+        if missing_keys:
+            print(f"Missing keys in the loaded state_dict: {missing_keys}")
+
+        if extra_keys:
+            print(f"Extra keys in the loaded state_dict: {extra_keys}")
+
+        model.medusa_head.load_state_dict(medusa_decoder_head_state_dict['medusa_head'], strict=False)
+        model.medusa_rms_norm.load_state_dict(medusa_decoder_head_state_dict['medusa_rms_norm'], strict=False)
+        model.medusa_decoder_layers.load_state_dict(medusa_decoder_head_state_dict['medusa_decoder_layers'], strict=False)
 
         return model
 
