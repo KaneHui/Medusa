@@ -80,6 +80,20 @@ def generate_medusa_buffers(medusa_choices, device="cuda"):
             cur_medusa_choice = sorted_medusa_choices[start + j]
             medusa_tree_indices[start + j + 1] = cur_medusa_choice[-1] + TOPK * i + 1
         start += depth_counts[i]
+    
+    # Generate two-gram indices for the Medusa structure
+    two_gram_indices = torch.zeros(len(sorted_medusa_choices), 3 , dtype=torch.long)
+
+    for i, choice in enumerate(sorted_medusa_choices):
+        choice_len = len(choice)
+        two_gram_indices[i][0] = choice_len - 1
+        if choice_len == 1:
+            two_gram_indices[i][1] = 0
+            two_gram_indices[i][2] = choice[0]
+        else:
+            two_gram_indices[i][1] = choice[-2]
+            two_gram_indices[i][2] = choice[-1]
+
 
     # Generate position IDs for the Medusa structure
     medusa_position_ids = torch.zeros(medusa_len, dtype=torch.long)
@@ -113,6 +127,7 @@ def generate_medusa_buffers(medusa_choices, device="cuda"):
         "tree_indices": medusa_tree_indices,
         "medusa_position_ids": medusa_position_ids,
         "retrieve_indices": retrieve_indices,
+        "two_gram_indices": two_gram_indices,
         }
     
     # Move the tensors in the dictionary to the specified device
@@ -125,7 +140,7 @@ def generate_medusa_buffers(medusa_choices, device="cuda"):
     return medusa_buffers
 
 
-def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values):
+def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values, output_orig = True, output_hidden_states = False):
     """
     Initializes the Medusa structure for a given model.
 
@@ -144,10 +159,10 @@ def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values):
     - logits (torch.Tensor): Original logits from the base model.
     """
     medusa_logits, outputs, logits = model(
-        input_ids, past_key_values=past_key_values, output_orig=True
+        input_ids, past_key_values=past_key_values, output_orig=output_orig, output_hidden_states=output_hidden_states
     )
     model.base_model.model.medusa_mask = medusa_attn_mask
-    return medusa_logits, logits
+    return medusa_logits, logits, outputs
 
 
 def reset_medusa_mode(
@@ -197,8 +212,8 @@ def two_gram_forward(model, input):
     with torch.inference_mode():
         embed = model.base_model.model.embed_tokens(input)
         return F.softmax(model.medusa_gram_head(embed), -1), embed
-
-def generate_candidates(model, medusa_logits, logits, tree_indices, retrieve_indices, threshold = 1e-3):
+    
+def generate_candidates(model, medusa_logits, logits, two_gram_indices, retrieve_indices):
     """
     Generate candidates based on provided logits and indices.
     
@@ -211,47 +226,46 @@ def generate_candidates(model, medusa_logits, logits, tree_indices, retrieve_ind
     Returns:
     - tuple: Returns cartesian candidates and tree candidates.
     """
-
-    # Greedy decoding: Select the most probable candidate from the original logits.
-    candidates_logit = torch.argmax(logits[:, -1]).unsqueeze(0)
-
-    # Extract the TOPK candidates from the medusa logits.
+    candidates_logit = torch.topk(logits[:, -1], TOPK, dim = -1).indices
     candidates_medusa_logits = torch.topk(medusa_logits[:, 0, -1], TOPK, dim = -1).indices
-
-    # Combine the selected candidate from the original logits with the topk medusa logits.
-    candidates = torch.cat([candidates_logit, candidates_medusa_logits.view(-1)], dim=-1)
-
-    # Map the combined candidates to the tree indices to get tree candidates.
-    tree_candidates = candidates[tree_indices]
-
-    # Extend the tree candidates by appending a zero.
+    candidates = torch.cat([candidates_logit, candidates_medusa_logits], dim=0)
+    candidates_2gram, candidates_embed = two_gram_forward(model, candidates)
+    candidates_medusa_expand = candidates[1:].repeat(1, TOPK).view(-1, TOPK, TOPK)
+    candidates_medusa_2gram_prob = torch.gather(
+        candidates_2gram[:-1], dim=-1, index=candidates_medusa_expand
+    )
+    candidates_medusa_2gram_prob_indices = candidates_medusa_2gram_prob.sort(dim=-1, descending = True).indices
+    candidates_two_gram_indices = candidates_medusa_2gram_prob_indices[two_gram_indices[:, 0], two_gram_indices[:, 1], two_gram_indices[:, 2]]
+    tree_indices = torch.zeros(len(candidates_two_gram_indices) + 1, 2, dtype=torch.long, device = candidates_two_gram_indices.device)
+    tree_indices[0, :] = 0
+    tree_indices[1:, 0] = two_gram_indices[:, 0] + 1
+    tree_indices[1:, 1] = candidates_two_gram_indices[:]
+    tree_candidates = candidates[tree_indices[:, 0], tree_indices[:, 1]]
     tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
-
-    # Retrieve the cartesian candidates using the retrieve indices.
     cart_candidates = tree_candidates_ext[retrieve_indices]
+    tree_candidates = tree_candidates.unsqueeze(0)
+    tree_candidates_embed = candidates_embed[tree_indices[:, 0], tree_indices[:, 1]]
+    # # Greedy decoding: Select the most probable candidate from the original logits.
+    # candidates_logit = torch.argmax(logits[:, -1]).unsqueeze(0)
 
-    # Unsqueeze the tree candidates for dimension consistency.
+    # # Extract the TOPK candidates from the medusa logits.
+    # candidates_medusa_logits = torch.topk(medusa_logits[:, 0, -1], TOPK, dim = -1).indices
+
+    # # Combine the selected candidate from the original logits with the topk medusa logits.
+    # candidates = torch.cat([candidates_logit, candidates_medusa_logits.view(-1)], dim=-1)
+
+    # # Map the combined candidates to the tree indices to get tree candidates.
+    # tree_candidates = candidates[tree_indices]
+
+    # # Extend the tree candidates by appending a zero.
+    # tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
+
+    # # Retrieve the cartesian candidates using the retrieve indices.
+    # cart_candidates = tree_candidates_ext[retrieve_indices]
+
+    # # Unsqueeze the tree candidates for dimension consistency.
     # tree_candidates = tree_candidates.unsqueeze(0)
-
-    tree_candidates_2gram, tree_candidates_emb = two_gram_forward(model, tree_candidates_ext.unsqueeze(0))
-
-    candidates_2gram = tree_candidates_2gram[0, retrieve_indices]
-    # print(candidates_2gram.shape, cart_candidates.shape)
-    candidate_mask = (candidates_2gram[:, :-1].gather(2, cart_candidates[:, 1:].unsqueeze(-1)).squeeze(-1) > threshold).to(candidates.dtype)
-    candidate_mask = torch.cumprod(candidate_mask, -1)
-
-    cur_retrieve_indices = retrieve_indices.clone()
-    cur_retrieve_indices[:, 1:][candidate_mask == 0] = -1
-    cur_retrieve_indices_pruned = torch.unique(cur_retrieve_indices, dim=0, return_inverse=False)
-    unique_token_ids = torch.unique(cur_retrieve_indices_pruned.flatten(), return_inverse=False)[1:]
-    tree_candidates = tree_candidates_ext[unique_token_ids].unsqueeze(0)
-    cart_candidates = tree_candidates_ext[cur_retrieve_indices_pruned]
-
-    relocate_id = torch.zeros(unique_token_ids.max() + 2, dtype = unique_token_ids.dtype, device = unique_token_ids.device)
-    relocate_id[unique_token_ids] = torch.arange(len(unique_token_ids), dtype = unique_token_ids.dtype, device = unique_token_ids.device)
-    relocate_id[-1] = -1
-    pruned_retrieve_indices_relocate = relocate_id[cur_retrieve_indices_pruned]
-    return cart_candidates, tree_candidates, unique_token_ids, pruned_retrieve_indices_relocate
+    return cart_candidates, tree_candidates, tree_candidates_embed
 
 
 def tree_decoding(
@@ -261,6 +275,8 @@ def tree_decoding(
     medusa_position_ids,
     input_ids,
     retrieve_indices,
+    output_orig = True,
+    output_hidden_states = False,
 ):
     """
     Decode the tree candidates using the provided model and reorganize the logits.
@@ -284,9 +300,10 @@ def tree_decoding(
     # The model is expected to return logits for the Medusa structure, original logits, and possibly other outputs.
     tree_medusa_logits, outputs, tree_logits = model(
         tree_candidates,
-        output_orig=True,
+        output_orig=output_orig,
         past_key_values=past_key_values,
         position_ids=position_ids,
+        output_hidden_states=output_hidden_states,
     )
     
     # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.

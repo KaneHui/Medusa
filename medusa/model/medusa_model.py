@@ -106,13 +106,20 @@ class MedusaModel(nn.Module):
                 for _ in range(medusa_num_heads)
             ]
         )
-
+        self.medusa_gram_head = nn.Sequential(
+                    *([ResBlock(self.hidden_size)] * medusa_num_layers),
+                    nn.Linear(self.hidden_size, self.vocab_size, bias=False),
+                )
+        
         # Ensure medusa_head's dtype and device align with the base_model
         self.medusa_head.to(self.base_model.dtype).to(self.base_model.device)
+        self.medusa_gram_head.to(self.base_model.dtype).to(self.base_model.device)
 
         for i in range(medusa_num_heads):
             # Initialize the weights of each medusa_head using the base model's weights
             self.medusa_head[i][-1].weight.data[:] = base_model.lm_head.weight.data[:]
+        
+        self.medusa_gram_head[-1].weight.data[:] = base_model.lm_head.weight.data[:]
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -174,6 +181,7 @@ class MedusaModel(nn.Module):
         past_key_values=None,
         output_orig=False,
         position_ids=None,
+        output_hidden_states = False,
     ):
         """Forward pass of the MedusaModel.
 
@@ -196,6 +204,7 @@ class MedusaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states=output_hidden_states,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])

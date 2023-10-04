@@ -60,7 +60,7 @@ def medusa_forward(input_ids, model, tokenizer, medusa_choices, temperature, pos
 
     input_len = input_ids.shape[1]
     reset_medusa_mode(model)
-    medusa_logits, logits = initialize_medusa(
+    medusa_logits, logits, _ = initialize_medusa(
             input_ids, model, medusa_buffers["medusa_attn_mask"], past_key_values
     )
     new_token = 0

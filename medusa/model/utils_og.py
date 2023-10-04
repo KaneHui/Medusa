@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 TOPK=10 # topk for sparse tree
 
@@ -193,12 +192,8 @@ def reset_past_key_values(passed_key_values):
             passed_key_values[i][j].current_length.fill_(0)
     return passed_key_values
 
-def two_gram_forward(model, input):
-    with torch.inference_mode():
-        embed = model.base_model.model.embed_tokens(input)
-        return F.softmax(model.medusa_gram_head(embed), -1), embed
 
-def generate_candidates(model, medusa_logits, logits, tree_indices, retrieve_indices, threshold = 1e-3):
+def generate_candidates(medusa_logits, logits, tree_indices, retrieve_indices):
     """
     Generate candidates based on provided logits and indices.
     
@@ -231,27 +226,8 @@ def generate_candidates(model, medusa_logits, logits, tree_indices, retrieve_ind
     cart_candidates = tree_candidates_ext[retrieve_indices]
 
     # Unsqueeze the tree candidates for dimension consistency.
-    # tree_candidates = tree_candidates.unsqueeze(0)
-
-    tree_candidates_2gram, tree_candidates_emb = two_gram_forward(model, tree_candidates_ext.unsqueeze(0))
-
-    candidates_2gram = tree_candidates_2gram[0, retrieve_indices]
-    # print(candidates_2gram.shape, cart_candidates.shape)
-    candidate_mask = (candidates_2gram[:, :-1].gather(2, cart_candidates[:, 1:].unsqueeze(-1)).squeeze(-1) > threshold).to(candidates.dtype)
-    candidate_mask = torch.cumprod(candidate_mask, -1)
-
-    cur_retrieve_indices = retrieve_indices.clone()
-    cur_retrieve_indices[:, 1:][candidate_mask == 0] = -1
-    cur_retrieve_indices_pruned = torch.unique(cur_retrieve_indices, dim=0, return_inverse=False)
-    unique_token_ids = torch.unique(cur_retrieve_indices_pruned.flatten(), return_inverse=False)[1:]
-    tree_candidates = tree_candidates_ext[unique_token_ids].unsqueeze(0)
-    cart_candidates = tree_candidates_ext[cur_retrieve_indices_pruned]
-
-    relocate_id = torch.zeros(unique_token_ids.max() + 2, dtype = unique_token_ids.dtype, device = unique_token_ids.device)
-    relocate_id[unique_token_ids] = torch.arange(len(unique_token_ids), dtype = unique_token_ids.dtype, device = unique_token_ids.device)
-    relocate_id[-1] = -1
-    pruned_retrieve_indices_relocate = relocate_id[cur_retrieve_indices_pruned]
-    return cart_candidates, tree_candidates, unique_token_ids, pruned_retrieve_indices_relocate
+    tree_candidates = tree_candidates.unsqueeze(0)
+    return cart_candidates, tree_candidates
 
 
 def tree_decoding(
