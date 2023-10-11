@@ -66,7 +66,7 @@ class KVCache:
         return torch.narrow(self.data, 2, 0, self.current_length)
 
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model, medusa_num_decoder_layers = 0, paddings = 256):
     """
     Initialize past key and value states for a given transformer model.
 
@@ -75,7 +75,8 @@ def initialize_past_key_values(model):
 
     Args:
         model (nn.Module): The transformer model for which past key-value states need to be initialized.
-
+        medusa_num_decoder_layers (int): The number of extra decoder layers in the model.
+        paddings (int): The number of paddings in the kvcache.
     Returns:
         tuple:
             - past_key_values (list): A list of KVCache objects for each layer in the model.
@@ -88,10 +89,10 @@ def initialize_past_key_values(model):
     batch_size = 1
     # Initializing a tensor to store past keys and values for all layers
     past_key_values_data = torch.zeros(
-        config.num_hidden_layers * 2,
+        (config.num_hidden_layers + medusa_num_decoder_layers) * 2,
         batch_size,
         config.num_attention_heads,
-        config.max_position_embeddings,
+        config.max_position_embeddings + paddings,
         config.hidden_size // config.num_attention_heads,
         device=model.device,
         dtype=model.dtype,
@@ -99,11 +100,11 @@ def initialize_past_key_values(model):
     # Initialize tensor to store the current length of the cached data for all layers.
     # [IMPORTANT] It needs to be kept on CPU for quick access and updates.
     current_length_data = torch.zeros(
-        config.num_hidden_layers * 2, dtype=torch.long, device="cpu"
+        (config.num_hidden_layers + medusa_num_decoder_layers) * 2, dtype=torch.long, device="cpu"
     )
     # Creating a KVCache for each pair of key and value in all layers
     past_key_values = [] * config.num_hidden_layers
-    for i in range(config.num_hidden_layers):
+    for i in range(config.num_hidden_layers + medusa_num_decoder_layers):
         past_key_values.append(
             [
                 KVCache(past_key_values_data[i * 2 + j], current_length_data[i * 2 + j])
