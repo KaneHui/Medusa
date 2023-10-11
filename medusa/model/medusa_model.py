@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
-from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM, LlamaDecoderLayer, LlamaRMSNorm, _make_causal_mask, _expand_mask
 from .utils import *
 from .kv_cache import initialize_past_key_values
 from .medusa_choices import mc_sim_7b_63
@@ -79,6 +79,7 @@ class MedusaModel(nn.Module):
         base_model,
         medusa_num_heads=4,
         medusa_num_layers=1,
+        medusa_num_decoder_layers=0,
         base_model_name_or_path="lmsys/vicuna-7b-v1.3",
     ):
         """
@@ -94,8 +95,32 @@ class MedusaModel(nn.Module):
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.medusa = medusa_num_heads
         self.medusa_num_layers = medusa_num_layers
+        self.medusa_num_decoder_layers = medusa_num_decoder_layers
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path)
+        # ===
+        # [MEDUSA-COPY]
+        # Fork two decoder layers and RMS norm for fine tuning with Medusa heads
+        if self.medusa_num_decoder_layers > 0:
+            self.medusa_decoder_layers = nn.ModuleList(
+                [LlamaDecoderLayer(base_model.config) for _ in range(medusa_num_decoder_layers)]
+            )
+            self.medusa_rms_norm = LlamaRMSNorm(self.hidden_size, eps=base_model.config.rms_norm_eps)
+        
+            self.medusa_decoder_layers.to(self.base_model.dtype).to(self.base_model.device)
+            self.medusa_rms_norm.to(self.base_model.dtype).to(self.base_model.device)
+
+        # Initialize Medusa decoder layers and RMS norm layer with the parameters from the last layers of the base model
+            for i in range(medusa_num_decoder_layers):
+                for name, param in self.medusa_decoder_layers[-(i + 1)].named_parameters():
+                    param.copy_(dict(base_model.model.layers[-(i + 1)].named_parameters())[name])
+            
+            for name, param in self.medusa_rms_norm.named_parameters():
+                param.copy_(dict(base_model.model.norm.named_parameters())[name])
+
+            for name, param in self.medusa_rms_norm_gram.named_parameters():
+                param.copy_(dict(base_model.model.norm.named_parameters())[name])
+        # ===
         # Create a list of Medusa heads
         self.medusa_head = nn.ModuleList(
             [
@@ -113,7 +138,7 @@ class MedusaModel(nn.Module):
         for i in range(medusa_num_heads):
             # Initialize the weights of each medusa_head using the base model's weights
             self.medusa_head[i][-1].weight.data[:] = base_model.lm_head.weight.data[:]
-
+        
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
 
@@ -139,6 +164,10 @@ class MedusaModel(nn.Module):
             MedusaModel: A MedusaModel instance loaded from the given path.
         """
         medusa_config = MedusaConfig.from_pretrained(medusa_head_name_or_path)
+        if hasattr(medusa_config, "medusa_num_decoder_layers"):
+            medusa_num_decoder_layers = medusa_config.medusa_num_decoder_layers
+        else:
+            medusa_num_decoder_layers = 0
         if medusa_num_heads is not None:
             print("Overriding medusa_num_heads as:", medusa_num_heads)
             medusa_config.medusa_num_heads = medusa_num_heads
@@ -154,6 +183,7 @@ class MedusaModel(nn.Module):
             base_model,
             medusa_config.medusa_num_heads,
             medusa_config.medusa_num_layers,
+            medusa_num_decoder_layers,
             medusa_config.base_model_name_or_path,
         )
         medusa_head_path = os.path.join(medusa_head_name_or_path, "medusa_lm_head.pt")
@@ -162,9 +192,95 @@ class MedusaModel(nn.Module):
         else:
             filename = hf_hub_download(medusa_head_name_or_path, "medusa_lm_head.pt")
         medusa_head_state_dict = torch.load(filename, map_location=base_model.device)
-        model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
+        if medusa_num_decoder_layers == 0:
+            model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
+        else:
+            model.medusa_head.load_state_dict(medusa_head_state_dict['medusa_head'], strict=False)
+            model.medusa_rms_norm.load_state_dict(medusa_head_state_dict['medusa_rms_norm'], strict=False)
+            model.medusa_decoder_layers.load_state_dict(medusa_head_state_dict['medusa_decoder_layers'], strict=False)
 
         return model
+
+    # Copied from modeling_llama_kv.LlamaModel._prepare_decoder_attention_mask
+    # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
+    def _prepare_decoder_attention_mask(
+        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+    ):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                # inputs_embeds.dtype,
+                torch.float32,  # [MODIFIED] force to cast to float32
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(
+                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+            ).to(inputs_embeds.device)
+            combined_attention_mask = (
+                expanded_attn_mask
+                if combined_attention_mask is None
+                else expanded_attn_mask + combined_attention_mask
+            )
+
+        # [MODIFIED] add medusa mask
+        if hasattr(self, "medusa_mask") and self.medusa_mask is not None:
+            medusa_mask = self.medusa_mask
+            medusa_len = medusa_mask.size(-1)
+            combined_attention_mask[:, :, -medusa_len:, -medusa_len:][
+                medusa_mask == 0
+            ] = combined_attention_mask.min()
+            if hasattr(self, "medusa_mode"):
+                # debug mode
+                if self.medusa_mode == "debug":
+                    torch.save(combined_attention_mask, "medusa_mask.pt")
+
+        return combined_attention_mask
+
+    # Copied from modeling_llama_kv.LlamaModel.forward
+    def _prepare_decoder_inputs(self, hidden_states, past_key_values, input_ids, position_ids, attention_mask):
+        batch_size, seq_length, _ = hidden_states.shape
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask,
+            (batch_size, seq_length),
+            # Passing hidden_states instead of input_embeds since only used
+            # for dtype and device
+            hidden_states,
+            past_key_values_length,
+        )
+
+        return attention_mask, position_ids
 
     def forward(
         self,
