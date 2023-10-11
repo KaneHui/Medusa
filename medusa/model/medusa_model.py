@@ -289,6 +289,8 @@ class MedusaModel(nn.Module):
         past_key_values=None,
         output_orig=False,
         position_ids=None,
+        # [MEDUSA-COPY]
+        output_hidden_states=True,
     ):
         """Forward pass of the MedusaModel.
 
@@ -299,7 +301,7 @@ class MedusaModel(nn.Module):
             past_key_values (tuple, optional): Tuple containing past key and value states for attention.
             output_orig (bool, optional): Whether to also output predictions from the original LM head.
             position_ids (torch.Tensor, optional): Position IDs.
-
+            output_hidden_states (bool, optional): Whether to output hidden states from the base model.
         Returns:
             torch.Tensor: A tensor containing predictions from all Medusa heads.
             (Optional) Original predictions from the base model's LM head.
@@ -311,11 +313,48 @@ class MedusaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states = output_hidden_states,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
         # Clone the output hidden states
-        hidden_states = outputs[0].clone()
+        if self.medusa_num_decoder_layers == 0:
+            hidden_states = outputs[0].clone()
+        else:
+            hidden_states = (outputs.hidden_states)[-1 * (self.medusa_num_decoder_layers + 1)].clone()
+            if past_key_values is not None:
+                attention_mask = self.base_model.model.attention_mask
+                position_ids = self.base_model.model.position_ids
+            else:
+                attention_mask, position_ids = self._prepare_decoder_inputs(
+                    hidden_states, past_key_values, input_ids, position_ids, attention_mask
+                )
+                # Pass hidden states through medusa decoder layers
+            if past_key_values is not None:
+                medusa_past_key_values = past_key_values[-self.medusa_num_decoder_layers:]
+                for i in range(self.medusa_num_decoder_layers):
+                    layer_outputs = self.medusa_decoder_layers[i](
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=medusa_past_key_values[i],
+                        output_attentions=False,
+                        use_cache=False,
+                    )
+                    hidden_states = layer_outputs[0]
+            else:
+                for i in range(self.medusa_num_decoder_layers):
+                    layer_outputs = self.medusa_decoder_layers[i](
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=None,
+                        output_attentions=False,
+                        use_cache=False,
+                    )
+                    hidden_states = layer_outputs[0]
+            hidden_states = self.medusa_rms_norm(hidden_states)
+            # ===
         medusa_logits = []
         # TODO: Consider parallelizing this loop for efficiency?
         for i in range(self.medusa):
