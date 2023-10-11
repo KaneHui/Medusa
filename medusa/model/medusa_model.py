@@ -110,16 +110,15 @@ class MedusaModel(nn.Module):
             self.medusa_decoder_layers.to(self.base_model.dtype).to(self.base_model.device)
             self.medusa_rms_norm.to(self.base_model.dtype).to(self.base_model.device)
 
-        # Initialize Medusa decoder layers and RMS norm layer with the parameters from the last layers of the base model
-            for i in range(medusa_num_decoder_layers):
-                for name, param in self.medusa_decoder_layers[-(i + 1)].named_parameters():
-                    param.copy_(dict(base_model.model.layers[-(i + 1)].named_parameters())[name])
-            
-            for name, param in self.medusa_rms_norm.named_parameters():
-                param.copy_(dict(base_model.model.norm.named_parameters())[name])
+            # Initialize Medusa decoder layers and RMS norm layer with the parameters from the last layers of the base model
+            with torch.inference_mode():
+                for i in range(medusa_num_decoder_layers):
+                    for name, param in self.medusa_decoder_layers[-(i + 1)].named_parameters():
+                        param.copy_(dict(base_model.model.layers[-(i + 1)].named_parameters())[name])
+                
+                for name, param in self.medusa_rms_norm.named_parameters():
+                    param.copy_(dict(base_model.model.norm.named_parameters())[name])
 
-            for name, param in self.medusa_rms_norm_gram.named_parameters():
-                param.copy_(dict(base_model.model.norm.named_parameters())[name])
         # ===
         # Create a list of Medusa heads
         self.medusa_head = nn.ModuleList(

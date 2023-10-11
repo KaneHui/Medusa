@@ -148,6 +148,57 @@ def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values):
     model.base_model.model.medusa_mask = medusa_attn_mask
     return medusa_logits, logits
 
+def initialize_medusa_austin(input_ids, model, medusa_attn_mask, past_key_values):
+    """
+    Initializes the Medusa structure for a given model.
+
+    This function performs the following operations:
+    1. Forward pass through the model to obtain the Medusa logits, original model outputs, and logits.
+    2. Sets the Medusa attention mask within the base model.
+
+    Args:
+    - input_ids (torch.Tensor): The input tensor containing token ids.
+    - model (MedusaLMHead): The model containing the Medusa layers and base model.
+    - medusa_attn_mask (torch.Tensor): The attention mask designed specifically for the Medusa structure.
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+
+    Returns:
+    - medusa_logits (torch.Tensor): Logits from the Medusa heads.
+    - logits (torch.Tensor): Original logits from the base model.
+    """
+    outputs = model.base_model.model(
+            input_ids=input_ids,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            position_ids=None,
+            output_hidden_states = True,
+        )
+    logits = model.base_model.lm_head(outputs[0])
+    hidden_states = (outputs.hidden_states)[-1 * (model.medusa_num_decoder_layers + 1)]
+    model.base_model.model.medusa_mask = medusa_attn_mask
+
+    medusa_past_key_values = past_key_values[-model.medusa_num_decoder_layers:]
+    attention_mask, position_ids = model._prepare_decoder_inputs(
+                hidden_states, medusa_past_key_values, None, None, None
+            )
+
+    for i in range(model.medusa_num_decoder_layers):
+        layer_outputs = model.medusa_decoder_layers[i](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=medusa_past_key_values[i],
+            output_attentions=False,
+            use_cache=False,
+        )
+        hidden_states = layer_outputs[0]
+    hidden_states = model.medusa_rms_norm(hidden_states)
+    medusa_logits = []
+    for i in range(model.medusa):
+        medusa_logits.append(model.medusa_head[i](hidden_states))
+    medusa_logits = torch.stack(medusa_logits, dim=0)
+    return medusa_logits, logits
+
 
 def reset_medusa_mode(
     model,
@@ -270,6 +321,46 @@ def tree_decoding(
     medusa_logits = tree_medusa_logits[:, 0, retrieve_indices]
     return medusa_logits, logits, outputs
 
+def tree_decoding_austin(
+    model,
+    tree_candidates,
+    past_key_values,
+    medusa_position_ids,
+    input_ids,
+    retrieve_indices,
+):
+    """
+    Decode the tree candidates using the provided model and reorganize the logits.
+    
+    Parameters:
+    - model (nn.Module): Model to be used for decoding the tree candidates.
+    - tree_candidates (torch.Tensor): Input candidates based on a tree structure.
+    - past_key_values (torch.Tensor): Past states, such as key and value pairs, used in attention layers.
+    - medusa_position_ids (torch.Tensor): Positional IDs associated with the Medusa structure.
+    - input_ids (torch.Tensor): Input sequence IDs.
+    - retrieve_indices (list or torch.Tensor): Indices for reordering the logits.
+    
+    Returns:
+    - tuple: Returns hidden states, regular logits, and other outputs from the model.
+    """
+
+    # Compute new position IDs by adding the Medusa position IDs to the length of the input sequence.
+    position_ids = medusa_position_ids + input_ids.shape[1]
+    
+    # Use the model to decode the tree candidates. 
+    # The model is expected to return logits for the Medusa structure, original logits, and possibly other outputs.
+    outputs = model.base_model.model(
+            input_ids=tree_candidates,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            output_hidden_states = True,
+        )
+    tree_logits = model.base_model.lm_head(outputs[0])
+    # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.
+    logits = tree_logits[0, retrieve_indices]
+    hidden_states = (outputs.hidden_states)[-1 * (model.medusa_num_decoder_layers + 1)]
+    return hidden_states, logits, outputs
 
 def evaluate_posterior(
     logits, candidates, temperature, posterior_threshold, posterior_alpha
@@ -395,6 +486,90 @@ def update_inference_inputs(
     medusa_logits = medusa_logits[
         :, None, best_candidate, accept_length : accept_length + 1
     ]
+    # Update the new token counter
+    new_token += accept_length + 1
+
+    return input_ids, logits, medusa_logits, new_token
+
+def update_inference_inputs_austin(
+    model,
+    input_ids,
+    candidates,
+    best_candidate,
+    accept_length,
+    retrieve_indices,
+    hidden_states,
+    logits,
+    medusa_logits,
+    new_token,
+    past_key_values,
+    past_key_values_data,
+    current_length_data,
+):
+    """
+    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
+
+    Args:
+    - input_ids (torch.Tensor): Current input token sequences.
+    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
+    - best_candidate (int): Index of the chosen best candidate.
+    - accept_length (int): Length of the accepted candidate sequence.
+    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
+    - hidden_states, logits, medusa_logits (torch.Tensor): Model's outputs from the previous inference step.
+    - new_token (int): Counter for the new tokens added during inference.
+    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
+
+    Returns:
+    - input_ids (torch.Tensor): Updated input token sequences.
+    - logits (torch.Tensor): Updated logits.
+    - medusa_logits (torch.Tensor): Updated medusa logits.
+    - new_token (int): Updated counter for the new tokens added.
+    """
+    # Calculate the starting position for new tokens based on the previous input length
+    prev_input_len = input_ids.shape[1]
+    # Map the best candidate indices to the original indices in the sequence
+    select_indices_raw = retrieve_indices[best_candidate, : accept_length + 1]
+    select_indices = (
+        select_indices_raw + prev_input_len
+    )
+    # Append the tokens from the best candidate to the input sequence
+    input_ids = torch.cat(
+        [input_ids, candidates[None, best_candidate, : accept_length + 1]], dim=-1
+    )
+    # Update the past key values based on the selected tokens
+    # Source tensor that contains relevant past information based on the selected candidate
+    tgt = past_key_values_data[:-model.medusa_num_decoder_layers * 2, ..., select_indices, :]
+    # Destination tensor where the relevant past information will be stored
+    dst = past_key_values_data[:-model.medusa_num_decoder_layers * 2, ..., prev_input_len : prev_input_len + tgt.shape[-2], :]
+    # Copy relevant past information from the source to the destination
+    dst.copy_(tgt, non_blocking=True)
+
+    # Update the current length tensor (currently only support batch size is 1)
+    current_length_data[:-model.medusa_num_decoder_layers * 2].fill_(prev_input_len + tgt.shape[-2])
+
+    medusa_past_key_values = past_key_values[-model.medusa_num_decoder_layers:]
+    hidden_states = hidden_states[:, select_indices_raw]
+    attention_mask, position_ids = model._prepare_decoder_inputs(
+                            hidden_states, medusa_past_key_values, None, None, None
+                        )
+    for i in range(model.medusa_num_decoder_layers):
+        layer_outputs = model.medusa_decoder_layers[i](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=medusa_past_key_values[i],
+            output_attentions=False,
+            use_cache=False,
+        )
+        hidden_states = layer_outputs[0]
+    hidden_states = model.medusa_rms_norm(hidden_states)
+    medusa_logits = []
+    for i in range(model.medusa):
+        medusa_logits.append(model.medusa_head[i](hidden_states))
+    medusa_logits = torch.stack(medusa_logits, dim=0)
+    # Extract logits and medusa logits for the accepted tokens
+    logits = logits[None, best_candidate, accept_length : accept_length + 1]
     # Update the new token counter
     new_token += accept_length + 1
 
