@@ -1,0 +1,11 @@
+conda create --name py39 python==3.9.0
+conda init
+conda deactivate
+conda activate py39
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+cd path_to_medusa
+pip install -e .
+pip install -e ".[train]"
+pip install matplotlib
+pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
+unset LD_LIBRARY_PATH
